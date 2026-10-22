@@ -162,8 +162,8 @@ func ListenLocal(addr string) (net.Listener, error) {
 
 // Serve accepts on ln until ctx is cancelled. Every accepted connection runs
 // the SOCKS5 handshake and, on CONNECT, relays to the conn dial returns.
-// A dial error is remembered and returned when the listener stops, so the
-// process can exit non-zero. A cancelled context alone is a clean stop.
+// Connection failures are reported through SOCKS replies. Only a listener
+// failure is returned; cancellation is a clean stop.
 func Serve(ctx context.Context, ln net.Listener, tb *routes.Table, dial Dialer) error {
 	if ln == nil || dial == nil {
 		return errors.New("internal")
@@ -175,14 +175,12 @@ func Serve(ctx context.Context, ln net.Listener, tb *routes.Table, dial Dialer) 
 		_ = ln.Close()
 	}()
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var failed error
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				wg.Wait()
-				return failed
+				return nil
 			}
 			return err
 		}
@@ -194,13 +192,7 @@ func Serve(ctx context.Context, ln net.Listener, tb *routes.Table, dial Dialer) 
 		go func() {
 			defer wg.Done()
 			defer c.Close()
-			if err := serveConn(ctx, c, tb, dial); err != nil && !errors.Is(err, context.Canceled) {
-				mu.Lock()
-				if failed == nil {
-					failed = err
-				}
-				mu.Unlock()
-			}
+			_ = serveConn(ctx, c, tb, dial)
 		}()
 	}
 }

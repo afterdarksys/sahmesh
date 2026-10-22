@@ -213,14 +213,48 @@ func readAll(t *testing.T, st *Stream, n int) []byte {
 }
 
 func TestReadyWindowAndIDs(t *testing.T) {
-	s, fc := dialReady(t, 5, Options{})
-	if s.ID() != msh || s.Window() != 5 {
+	s, fc := dialReady(t, MinWindow, Options{})
+	if s.ID() != msh || s.Window() != MinWindow {
 		t.Fatalf("session %s window %d", s.ID(), s.Window())
 	}
 	_, id1 := openConnected(t, s, fc, "local", 22)
 	_, id2 := openConnected(t, s, fc, "10.0.0.7", 3389)
 	if id1 != 1 || id2 != 2 {
 		t.Fatalf("ids %d %d", id1, id2)
+	}
+}
+
+func TestReadyWindowBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		window int
+		valid  bool
+	}{
+		{"below_minimum", MinWindow - 1, false},
+		{"minimum", MinWindow, true},
+		{"maximum", MaxWindow, true},
+		{"above_maximum", MaxWindow + 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.valid {
+				s, _ := dialReady(t, tc.window, Options{})
+				if s.Window() != tc.window {
+					t.Fatalf("window %d", s.Window())
+				}
+				return
+			}
+			fs := newFake(t)
+			go func() { fs.accept(t).ready(tc.window) }()
+			s, err := Dial(context.Background(), fs.wsURL(), fs.srv.Client(), Options{})
+			if s != nil {
+				_ = s.Close()
+				t.Fatal("accepted invalid window")
+			}
+			var se *StatusError
+			if !errors.As(err, &se) || se.Code != "protocol_error" {
+				t.Fatalf("invalid window: %v", err)
+			}
+		})
 	}
 }
 
@@ -278,15 +312,16 @@ func TestStreamErrorLeavesOtherAlive(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(closes) != 1 || closes[0].Reason != "target_denied" || closes[0].Stream != 2 {
+	// A refused Open reports its error to the caller, not OnClose.
+	if len(closes) != 0 {
 		t.Fatalf("closes %v", closes)
 	}
 }
 
 func TestServerOverrunIsProtocolError(t *testing.T) {
-	s, fc := dialReady(t, 10, Options{})
+	s, fc := dialReady(t, MinWindow, Options{})
 	a, ida := openConnected(t, s, fc, "local", 5432)
-	fc.sendData(uint32(ida), bytes.Repeat([]byte{1}, 10))
+	fc.sendData(uint32(ida), bytes.Repeat([]byte{1}, MinWindow))
 	fc.sendData(uint32(ida), []byte{2})
 	select {
 	case <-s.Done():
@@ -297,9 +332,9 @@ func TestServerOverrunIsProtocolError(t *testing.T) {
 	if err := s.Err(); !errors.As(err, &se) || se.Code != "protocol_error" {
 		t.Fatalf("session err %v", err)
 	}
-	buf := make([]byte, 64)
+	buf := make([]byte, MinWindow)
 	n, _ := a.Read(buf)
-	if n != 10 {
+	if n != MinWindow {
 		t.Fatalf("read %d", n)
 	}
 	if _, err := a.Read(buf); !errors.As(err, &se) || se.Code != "protocol_error" {
@@ -314,28 +349,28 @@ func TestServerOverrunIsProtocolError(t *testing.T) {
 }
 
 func TestClientRespectsCredit(t *testing.T) {
-	s, fc := dialReady(t, 10, Options{})
+	s, fc := dialReady(t, MinWindow, Options{})
 	a, ida := openConnected(t, s, fc, "local", 5432)
 	wrote := make(chan error, 1)
-	go func() { _, err := a.Write(bytes.Repeat([]byte{7}, 25)); wrote <- err }()
-	if d := fc.expectData(); d.id != uint32(ida) || len(d.p) != 10 {
+	go func() { _, err := a.Write(bytes.Repeat([]byte{7}, 2*MinWindow+MinWindow/2)); wrote <- err }()
+	if d := fc.expectData(); d.id != uint32(ida) || len(d.p) != MinWindow {
 		t.Fatalf("first chunk %d", len(d.p))
 	}
 	fc.noData(150 * time.Millisecond)
-	fc.send(map[string]any{"type": "mesh_credit", "stream": ida, "bytes": 10})
-	if d := fc.expectData(); len(d.p) != 10 {
+	fc.send(map[string]any{"type": "mesh_credit", "stream": ida, "bytes": MinWindow})
+	if d := fc.expectData(); len(d.p) != MinWindow {
 		t.Fatalf("second chunk %d", len(d.p))
 	}
 	fc.noData(150 * time.Millisecond)
-	fc.send(map[string]any{"type": "mesh_credit", "stream": ida, "bytes": 10})
-	if d := fc.expectData(); len(d.p) != 5 {
+	fc.send(map[string]any{"type": "mesh_credit", "stream": ida, "bytes": MinWindow})
+	if d := fc.expectData(); len(d.p) != MinWindow/2 {
 		t.Fatalf("third chunk %d", len(d.p))
 	}
 	if err := <-wrote; err != nil {
 		t.Fatal(err)
 	}
-	// Credit past the window from the server is a violation.
-	fc.send(map[string]any{"type": "mesh_credit", "stream": ida, "bytes": 10})
+	// Return the outstanding half window, then over-return one byte.
+	fc.send(map[string]any{"type": "mesh_credit", "stream": ida, "bytes": MinWindow / 2})
 	fc.send(map[string]any{"type": "mesh_credit", "stream": ida, "bytes": 1})
 	<-s.Done()
 	if fc.closeStatus() != websocket.StatusProtocolError {
@@ -344,27 +379,29 @@ func TestClientRespectsCredit(t *testing.T) {
 }
 
 func TestCreditReturnedOnRead(t *testing.T) {
-	s, fc := dialReady(t, 8, Options{})
+	s, fc := dialReady(t, MinWindow, Options{})
 	a, ida := openConnected(t, s, fc, "local", 5432)
-	fc.sendData(uint32(ida), []byte("12345678"))
-	got := readAll(t, a, 8)
-	if string(got) != "12345678" {
+	first := bytes.Repeat([]byte("12345678"), MinWindow/8)
+	fc.sendData(uint32(ida), first)
+	got := readAll(t, a, MinWindow)
+	if !bytes.Equal(got, first) {
 		t.Fatal(string(got))
 	}
 	total := int64(0)
-	for total < 8 {
+	for total < MinWindow {
 		f := fc.expect("mesh_credit")
 		if *f.Stream != ida || f.Bytes == nil || *f.Bytes <= 0 {
 			t.Fatalf("credit frame %+v", f)
 		}
 		total += *f.Bytes
 	}
-	if total != 8 {
+	if total != MinWindow {
 		t.Fatalf("returned %d", total)
 	}
 	// The window is open again.
-	fc.sendData(uint32(ida), []byte("abcdefgh"))
-	if string(readAll(t, a, 8)) != "abcdefgh" {
+	second := bytes.Repeat([]byte("abcdefgh"), MinWindow/8)
+	fc.sendData(uint32(ida), second)
+	if !bytes.Equal(readAll(t, a, MinWindow), second) {
 		t.Fatal("second window")
 	}
 	select {
@@ -501,7 +538,7 @@ func TestDialRefusals(t *testing.T) {
 	}
 	go func() {
 		fc := fs.accept(t)
-		fc.send(map[string]any{"type": "mesh_ready", "payload": map[string]any{"session_id": "bad", "window": 10}})
+		fc.send(map[string]any{"type": "mesh_ready", "payload": map[string]any{"session_id": "bad", "window": MinWindow}})
 	}()
 	if _, err := Dial(context.Background(), fs.wsURL(), fs.srv.Client(), Options{}); !errors.As(err, &se) || se.Code != "protocol_error" {
 		t.Fatalf("bad ready: %v", err)

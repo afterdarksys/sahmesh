@@ -30,12 +30,14 @@ func cmdUp(args []string, stdout, stderr io.Writer, env func(string) string) int
 		}
 		return 2
 	}
-	if _, err := socks.ListenLocal(o.listen); err != nil {
+	probe, err := socks.ListenLocal(o.listen)
+	if err != nil {
 		// Validate the bind address before any credential is read or any
 		// request is made. The probe listener is closed at once.
 		fmt.Fprintln(stderr, "bind_refused")
 		return 2
 	}
+	_ = probe.Close()
 	routesPath := o.routesFile
 	if routesPath == "" {
 		p, perr := routes.DefaultPath(env)
@@ -84,7 +86,7 @@ func cmdUp(args []string, stdout, stderr io.Writer, env func(string) string) int
 	pool := &sessions{api: api, ws: client.NewHTTPClient(nil, 0), stderr: stderr, hosts: map[string]*entry{}}
 	err = socks.Serve(ctx, ln, o.table, pool.dial)
 	pool.closeAll()
-	if err != nil || pool.failed() {
+	if err != nil {
 		return 1
 	}
 	return 0
@@ -104,21 +106,8 @@ type sessions struct {
 	ws     *http.Client
 	stderr io.Writer
 
-	mu      sync.Mutex
-	hosts   map[string]*entry
-	failed_ bool
-}
-
-func (p *sessions) failed() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.failed_
-}
-
-func (p *sessions) note() {
-	p.mu.Lock()
-	p.failed_ = true
-	p.mu.Unlock()
+	mu    sync.Mutex
+	hosts map[string]*entry
 }
 
 func (p *sessions) dial(ctx context.Context, agent, host string, port int) (net.Conn, error) {
@@ -173,9 +162,6 @@ func (p *sessions) session(ctx context.Context, agent string) (*mesh.Session, er
 	}
 	s, err := mesh.Dial(ctx, u.String(), p.ws, mesh.Options{OnClose: func(ci mesh.CloseInfo) {
 		fmt.Fprintf(p.stderr, "mesh_close host=%s stream=%d reason=%s bytes_in=%d bytes_out=%d\n", agent, ci.Stream, ci.Reason, ci.BytesIn, ci.BytesOut)
-		if ci.Reason != "closed" {
-			p.note()
-		}
 	}})
 	if err != nil {
 		return nil, err
@@ -187,7 +173,6 @@ func (p *sessions) session(ctx context.Context, agent string) (*mesh.Session, er
 		reason := "closed"
 		if err := s.Err(); err != nil {
 			reason = err.Error()
-			p.note()
 		}
 		fmt.Fprintf(p.stderr, "mesh_session host=%s state=down reason=%s\n", agent, reason)
 	}()
@@ -198,7 +183,6 @@ func (p *sessions) report(agent string, err error) {
 	if errors.Is(err, context.Canceled) {
 		return
 	}
-	p.note()
 	fmt.Fprintf(p.stderr, "mesh_error host=%s code=%s\n", agent, codeOf(err))
 }
 

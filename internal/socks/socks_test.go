@@ -23,13 +23,14 @@ type dialCall struct {
 // rig serves one listener with a recording dialer. dial returns a pipe
 // whose other end the test holds, or the error the test set.
 type rig struct {
-	t     *testing.T
-	ln    net.Listener
-	mu    sync.Mutex
-	calls []dialCall
-	fail  error
-	peers chan net.Conn
-	errs  chan error
+	t      *testing.T
+	ln     net.Listener
+	mu     sync.Mutex
+	calls  []dialCall
+	fail   error
+	peers  chan net.Conn
+	errs   chan error
+	cancel context.CancelFunc
 }
 
 func newRig(t *testing.T, tb *routes.Table) *rig {
@@ -58,6 +59,7 @@ func newRig(t *testing.T, tb *routes.Table) *rig {
 		}
 	}()
 	ctx, cancel := context.WithCancel(context.Background())
+	r.cancel = cancel
 	t.Cleanup(cancel)
 	go func() {
 		r.errs <- Serve(ctx, ln, tb, func(ctx context.Context, agent, host string, port int) (net.Conn, error) {
@@ -151,6 +153,41 @@ func reply(t *testing.T, c net.Conn) byte {
 		t.Fatalf("reply atyp %d", head[3])
 	}
 	return head[1]
+}
+
+func TestCanceledServeAfterRefusal(t *testing.T) {
+	r := newRig(t, nil)
+	r.mu.Lock()
+	r.fail = &mesh.StatusError{Code: "target_denied"}
+	r.mu.Unlock()
+	c := r.client()
+	handshake(t, c)
+	must(t, c, connectDomain("web1.sah", 5432))
+	if rep := reply(t, c); rep != ReplyNotAllowed {
+		t.Fatalf("reply %d", rep)
+	}
+	r.cancel()
+	select {
+	case err := <-r.errs:
+		if err != nil {
+			t.Fatalf("clean shutdown after refusal: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("shutdown timed out")
+	}
+}
+
+func TestListenerFailureIsReturned(t *testing.T) {
+	r := newRig(t, nil)
+	_ = r.ln.Close()
+	select {
+	case err := <-r.errs:
+		if err == nil {
+			t.Fatal("listener failure was hidden")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("listener failure timed out")
+	}
 }
 
 func TestDomainRoutesToAgentLocal(t *testing.T) {

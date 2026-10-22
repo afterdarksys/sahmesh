@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"net"
 	"strings"
 	"testing"
 )
@@ -85,4 +86,29 @@ func TestParseOpts(t *testing.T) {
 	if err != nil || d.listen != "127.0.0.1:1080" || d.routesFile != "" {
 		t.Fatalf("defaults %+v %v", d, err)
 	}
+}
+
+func TestStartupReleasesProbeListener(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	var out, errs bytes.Buffer
+	configDir := t.TempDir()
+	code := run([]string{"up", "--listen", addr}, &out, &errs, func(k string) string {
+		if k == "XDG_CONFIG_HOME" {
+			return configDir
+		}
+		return ""
+	})
+	if code != 2 || !strings.Contains(errs.String(), "systemapi_url is not set") {
+		t.Fatalf("startup: %d %q", code, errs.String())
+	}
+	ln, err = net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("probe listener leaked: %v", err)
+	}
+	_ = ln.Close()
 }
